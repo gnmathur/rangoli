@@ -22,13 +22,14 @@ Rangoli is a local-first podcast transcription tool that converts podcast audio 
 │  │  .txt file output │       │  │  Engine dropdown │  │  │
 │  │                   │       │  │  Diarize toggle  │  │  │
 │  └────────┬──────────┘       │  │  Podcast list    │  │  │
+│           │                  │  │   (with icons)   │  │  │
 │           │                  │  └──────────────────┘  │  │
 │           │                  │  ┌──────────────────┐  │  │
 │           │                  │  │ Main area        │  │  │
 │           │                  │  │  Episode table   │  │  │
+│           │                  │  │   (with blurbs)  │  │  │
 │           │                  │  │  Progress bar    │  │  │
 │           │                  │  │  Progress detail │  │  │
-│           │                  │  │  Transcript view │  │  │
 │           │                  │  └──────────────────┘  │  │
 │           │                  └───────────┬────────────┘  │
 └───────────┼──────────────────────────────┼──────────────┘
@@ -154,46 +155,47 @@ On macOS, the menu bar app name is set to "Rangoli" by modifying `CFBundleName` 
 
 ```
 macOS:
-  Rangoli │ File
-  ──────┼──────────────────
-  About │ Add Podcast  ⌘N
-  Rangoli │ Remove Podcast
-        │
+  Rangoli │ File              │ View           │ AI
+  ──────┼──────────────────┼────────────────┼──────────────────────
+  About │ Add Podcast  ⌘N  │ Dark Mode      │ Edit Prompt Template...
+  Rangoli │ Remove Podcast   │ Light Mode     │
+        │                  │                │
         │ (Quit added by macOS automatically)
 
 Other platforms:
-  File             │ Help
-  ─────────────────┼──────────
-  Add Podcast Ctrl+N│ About Rangoli
-  Remove Podcast   │
-  ─────────────────│
-  Quit       Ctrl+Q│
+  File             │ View         │ AI                     │ Help
+  ─────────────────┼──────────────┼────────────────────────┼──────────
+  Add Podcast Ctrl+N│ Dark Mode   │ Edit Prompt Template...│ About Rangoli
+  Remove Podcast   │ Light Mode   │                        │
+  ─────────────────│              │                        │
+  Quit       Ctrl+Q│              │                        │
 ```
 
 The About dialog displays the app icon, name, version, subtitle ("Podcast Transcriber"), author, copyright, and license.
 
 #### Window Layout
 ```
-┌──────────────────┬──────────────────────────────────────────┬───────────────┐
-│  Sidebar (resiz) │  Main Area                               │  Transcript   │
-│  PanedWindow     │  expands with window                     │  Panel        │
-│                  │                                          │               │
-│ [🪷 Rangoli  [+]]│  [Episode Title        < > 1/3  [Trans]] │  Transcript   │
-│                  │                                          │  ──────────── │
-│  Model:  [base▼] │  # │ Title     │Published│ Dur   │Status│  [00:00:05]   │
-│  Engine: [wh..▼] │  1 │ Ep One    │Feb 24   │45m 0s │ Done │  Welcome to.. │
-│  [✓] Diarize    │  2 │ Ep Two    │Feb 17   │30m 0s │      │  [00:00:12]   │
-│                  │  3 │ Ep Three  │Feb 10   │52m 0s │      │  Thanks for.. │
-│  ┌────────────┐  │                                          │               │
-│  │ Podcast A  │  │  [████████████████░░░░] Stage 3/4: ...  │  [Copy][Close]│
-│  │ Podcast B  │  │  faster-whisper 'base' — 42 segs | ...  │               │
-│  │ Podcast C  │  │                                          │               │
-│  │            │  │                                          │               │
-│  └────────────┘  │                                          │               │
-│  [Remove Podcast]│                                          │               │
-└──────────────────┴──────────────────────────────────────────┴───────────────┘
+┌──────────────────┬────────────────────────────────────────────┬──────────────────┐
+│  Sidebar (resiz) │  Main Area                                 │  Analysis Panel  │
+│  PanedWindow     │  expands with window                       │  (3rd column,    │
+│                  │                                            │   shown on       │
+│ [🪷 Rangoli  [+]]│  Episode Title            < Page 1/3 >    │   demand)        │
+│                  │                                            │                  │
+│  Model:  [base▼] │  # │ Title      │Pub  │ Dur  │ Status     │  Analysis [Close]│
+│  Engine: [wh..▼] │  1 │ Ep One     │Feb24│ 45m  │ Analyzed   │  ┌──────────────┐│
+│  [✓] Diarize    │    │ Summary.. │     │      │            │  │ Summary text ││
+│                  │  2 │ Ep Two     │Feb17│ 30m  │ Transcribed│  │ from OpenAI  ││
+│  ┌──┬─────────┐  │    │ Blurb..   │     │      │            │  │ ...          ││
+│  │🎙│Podcast A │  │  3 │ Ep Three   │Feb10│ 52m  │            │  │              ││
+│  │🎙│Podcast B │  │    │ Summary.. │     │      │            │  └──────────────┘│
+│  │🎙│Podcast C │  │                                            │         [Copy]  │
+│  │  │          │  │  [████████████████░░░░] 42 segs   [Stop]  │                  │
+│  └──┴─────────┘  │  Stage 3/4: Transcribing...                │                  │
+│  [Remove Podcast]│                                            │                  │
+└──────────────────┴────────────────────────────────────────────┴──────────────────┘
 
 Right-click a podcast → modal dialog with artwork, name, and description.
+Right-click an episode → context menu: Transcribe | Analyze with AI | Copy Transcript | Show Analysis.
 ```
 
 #### Duration Normalization
@@ -209,36 +211,53 @@ Episode durations from RSS feeds arrive in varied formats from the `itunes_durat
 #### Layout Structure
 ```
 PanedWindow (horizontal, resizable sash):
-  Pane 0 — Sidebar (initial 280px, min 200px):
+  Pane 0 — Sidebar (initial 320px, min 200px):
     Row 0: Header (icon + "Rangoli" + add button)
     Row 1: Settings grid (Model, Engine, Diarize — aligned labels/dropdowns)
     Row 3: Scrollable podcast list (weight=1, expands)
+      Each podcast: grid row with artwork icon (24x24, col 0) + name label (bold, col 1)
+      All widgets use cursor="arrow" for native macOS look
     Row 4: Remove Podcast button
 
   Pane 1 — Main Area (min 500px):
-    Row 0: Top bar (episode header, pagination, transcribe button)
-    Row 1: Pane (weight=1, expands):
-      Pane Row 0: Episode table with #/Title/Published/Duration/Status (weight=1)
-      Pane Row 1: Progress area (fixed height)
+    Row 0: Top bar (episode header + pagination)
+    Row 1: Episode table with #/Title+Blurb/Published/Duration/Status (weight=1)
+      Dynamic page size based on window height
+      Right-click → context menu (Transcribe / Analyze with AI / Copy Transcript / Show Analysis)
+      All widgets use cursor="arrow" (must be set on each child — tkinter doesn't inherit)
+    Row 2: Progress area (fixed height)
+      Row 0: Progress bar (expands) + detail label + Stop button (right, hidden by default)
+      Row 1: Stage label (below bar)
 
-  Pane 2 — Transcript Panel (optional, shown on episode select/transcription, min 250px):
-    Row 0: "Transcript" header
-    Row 1: Transcript textbox (scrollable, read-only, Menlo font)
-    Row 2: Bottom bar (Copy + Close buttons)
+  Pane 2 — Analysis Panel (shown on demand, min 200px, initial 300px):
+    Row 0: "Analysis" header + Close button (right-aligned)
+    Row 1: CTkTextbox (scrollable, read-only, Menlo font, weight=1)
+    Row 2: Copy button (right-aligned)
+    Added/removed from PanedWindow via _show_analysis_panel()/_close_analysis_panel()
 
-  Podcast Info — Modal dialog (CTkToplevel, shown on right-click):
+  Podcast Info — Modal dialog (CTkToplevel, shown on right-click podcast):
     Artwork (48x48) + podcast name, separator, description textbox, Close button
+    Uses withdraw/deiconify pattern for flicker-free centering
+
+  Prompt Editor — Modal dialog (CTkToplevel, shown from AI menu):
+    Multiline CTkTextbox with current prompt, Save/Reset Default/Cancel buttons
 ```
 
 #### Threading Model
 
-All network I/O and transcription runs in a daemon thread spawned from `_on_transcribe()`. The GUI thread never blocks.
+All network I/O and transcription runs in daemon threads. The GUI thread never blocks.
 
-**Thread communication**: The worker thread calls `self.after(0, lambda: ...)` to schedule UI updates on the main thread. This is Tkinter's standard thread-safe callback mechanism.
+**Background threads**:
+- **Transcription worker**: Spawned from `_on_transcribe()` — handles download, model loading, transcription, and diarization
+- **Model preloading**: At startup, `_preload_models()` spawns threads to preload `base` and `small` models for both engines
+- **Feed refresh**: `_refresh_all_podcasts()` runs at startup to refresh all podcast feeds
+- **Artwork loading**: Each podcast's icon is fetched and processed in a background thread
 
-**Concurrency guard**: `self._transcribing` flag prevents:
-- Starting a second transcription
-- Selecting a different episode during transcription
+**Thread communication**: The worker threads call `self.after(0, lambda: ...)` to schedule UI updates on the main thread. This is Tkinter's standard thread-safe callback mechanism.
+
+**Model cache**: A global `_model_cache` dict with `_model_cache_lock` (`threading.Lock`) provides thread-safe model caching. `_get_or_load_model()` checks the cache under lock, loads outside the lock (to avoid blocking concurrent requests), then stores the result. This ensures each engine+model combination is loaded only once.
+
+**Concurrency guard**: `self._transcribing` flag prevents starting a second transcription. `self._analyzing` flag prevents concurrent OpenAI analyses.
 
 #### Cancellation
 
@@ -246,7 +265,7 @@ Cancellation uses cooperative signaling via `threading.Event`:
 
 - **Signal**: `self._cancel_event` (`threading.Event`) — set by `_on_stop()` on the main thread
 - **Check**: `_check_cancelled()` — called by the worker at every interruptible point, raises `_TranscriptionCancelled` if the event is set
-- **UI**: When transcription starts, the "Transcribe" button becomes a red "Stop" button. Clicking it sets the cancel event and changes the button text to "Stopping...". After the worker exits, `_transcription_done()` restores the button to its original state.
+- **UI**: When transcription starts, a red "Stop" button appears next to the progress bar (via `grid()`). Clicking it sets the cancel event and changes the button text to "Stopping...". After the worker exits, `_transcription_done()` hides the stop button (via `grid_remove()`).
 
 **Cancellation checkpoints** in `_transcribe_worker()`:
 1. After each download chunk (8 KB granularity — stops within milliseconds)
@@ -267,7 +286,7 @@ Inner try/finally block catches it:
     ▼
 Outer except _TranscriptionCancelled:
     → Sets progress to "Cancelled"
-    → Shows "Transcription cancelled." in transcript box
+    → Sets progress detail to "Transcription cancelled."
     │
     ▼
 Outer finally:
@@ -282,31 +301,30 @@ Main Thread                    Worker Thread
     ├─ _on_transcribe()             │
     │   set _transcribing=True      │
     │   clear _cancel_event         │
-    │   button → red "Stop"         │
+    │   stop_btn.grid() (show)      │
     │   spawn thread ──────────────►│
     │                               ├─ download audio
     │   ◄── after(0, update_prog) ──┤   _check_cancelled() per chunk
     │                               │
     ├─ user clicks Stop             ├─ _check_cancelled() → raises
     │   _cancel_event.set()         │   _TranscriptionCancelled
-    │   button → "Stopping..."      │
+    │   stop_btn → "Stopping..."    │
     │                               ├─ finally: delete temp file
     │   ◄── after(0, "Cancelled") ──┤
     │   ◄── after(0, done) ─────────┤
-    │   button → "Transcribe"       ▼
+    │   stop_btn.grid_remove()      ▼
     │
     │  ── OR (normal completion) ──
     │                               │
-    │                               ├─ load model
+    │                               ├─ load model (from cache or fresh)
     │   ◄── after(0, update_prog) ──┤   _check_cancelled()
     │                               ├─ transcribe
     │   ◄── after(0, update_prog) ──┤   _check_cancelled() per segment
     │                               ├─ diarize (optional)
     │   ◄── after(0, update_prog) ──┤   _check_cancelled()
     │                               ├─ format + save to DB
-    │   ◄── after(0, set_text) ─────┤
     │   ◄── after(0, done) ─────────┤
-    │   button → "Transcribe"       ▼
+    │   stop_btn.grid_remove()      ▼
 ```
 
 #### Progress Pipeline
@@ -357,13 +375,14 @@ podcasts
   added_at    TEXT NOT NULL              -- ISO 8601
 
 episodes
-  id          INTEGER PRIMARY KEY AUTOINCREMENT
-  podcast_id  INTEGER NOT NULL           -- FK → podcasts.id (CASCADE DELETE)
-  title       TEXT NOT NULL
-  published   TEXT DEFAULT ''
-  summary     TEXT DEFAULT ''
-  audio_url   TEXT NOT NULL
-  duration    TEXT DEFAULT ''
+  id           INTEGER PRIMARY KEY AUTOINCREMENT
+  podcast_id   INTEGER NOT NULL           -- FK → podcasts.id (CASCADE DELETE)
+  title        TEXT NOT NULL
+  published    TEXT DEFAULT ''             -- raw RFC 2822 date string
+  published_at TEXT DEFAULT ''             -- ISO 8601 for sortable ordering
+  summary      TEXT DEFAULT ''
+  audio_url    TEXT NOT NULL
+  duration     TEXT DEFAULT ''
 
 transcripts
   id              INTEGER PRIMARY KEY AUTOINCREMENT
@@ -372,6 +391,14 @@ transcripts
   model_used      TEXT NOT NULL           -- e.g. "base", "medium"
   diarized        INTEGER DEFAULT 0       -- boolean
   transcribed_at  TEXT NOT NULL           -- ISO 8601
+
+analyses
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  episode_id      INTEGER UNIQUE NOT NULL -- FK → episodes.id (CASCADE DELETE)
+  text            TEXT NOT NULL
+  prompt_used     TEXT NOT NULL           -- prompt template used for analysis
+  model_used      TEXT NOT NULL           -- e.g. "gpt-4o"
+  analyzed_at     TEXT NOT NULL           -- ISO 8601
 ```
 
 #### Key design decisions
@@ -385,7 +412,9 @@ transcripts
 #### Entity Relationship
 ```
 podcasts 1──────* episodes 1──────? transcripts
-         CASCADE          CASCADE
+         CASCADE    │     CASCADE
+                    └──────? analyses
+                           CASCADE
 ```
 
 ### 6. CLI Application
@@ -461,9 +490,10 @@ Required:
 Optional:
   faster-whisper ─── ctranslate2, tokenizers, av (CTranslate2 engine)
   pyannote.audio ─── torch (speaker diarization)
+  openai ──────────── OpenAI API client (transcript analysis)
 ```
 
-**Graceful degradation**: Both optional dependencies use conditional imports:
+**Graceful degradation**: All optional dependencies use conditional imports:
 ```python
 try:
     from faster_whisper import WhisperModel
@@ -494,17 +524,115 @@ UI elements (dropdowns, checkboxes) are disabled when their backing dependency i
 | Component          | CLI behavior                   | GUI behavior                          |
 |--------------------|--------------------------------|---------------------------------------|
 | Feed fetch failure | `sys.exit(1)` with message     | Exception caught, shown in dialog     |
-| Download failure   | Exception propagates, temp file cleaned up | Caught in worker, shown in transcript box |
+| Download failure   | Exception propagates, temp file cleaned up | Caught in worker, shown in progress detail |
 | Transcription error| Exception propagates           | Caught in worker, progress resets     |
 | Missing engine     | `sys.exit(1)` with install hint| Dropdown option not shown             |
 | Missing HF_TOKEN   | Warning printed, diarize skipped | Checkbox works but diarize is a no-op |
 
 All temp files are cleaned up in `finally` blocks regardless of error path.
 
+## Design Choices
+
+- **Local transcription**: Uses Whisper running locally — no API keys needed for basic transcription, fully offline capable after model download
+- **Dual engine support**: Supports both OpenAI Whisper and faster-whisper (CTranslate2). faster-whisper provides ~4x faster CPU inference via int8 quantization with comparable accuracy
+- **RSS-first approach**: Takes a standard podcast RSS feed URL as input, making it compatible with virtually any podcast
+- **Optional diarization**: Speaker diarization via pyannote.audio is opt-in; the tool works without it if you just need a plain transcript
+- **Temporary audio**: Downloaded episode audio is stored in a temp file and deleted after transcription to avoid disk bloat
+- **Segment-level output**: Preserves Whisper's timestamp segments for navigable transcripts
+- **SQLite persistence (GUI)**: The GUI uses SQLite to persist podcasts, episodes, and generated transcripts across sessions. No external database needed
+- **CustomTkinter GUI**: Modern dark-mode UI using CustomTkinter for a polished Material-style look without heavy Qt/Electron dependencies
+- **Stage-based progress reporting**: 4-stage progress pipeline (download, model loading, transcription, diarization) with per-segment metrics and live ETA
+- **Model caching and preloading**: Whisper models are downloaded once and cached at `~/.cache/whisper/`. The GUI preloads `base` and `small` models in background threads at startup. A thread-safe model cache ensures each model is loaded only once
+- **Duration normalization**: Episode durations from RSS feeds (raw seconds, MM:SS, HH:MM:SS) are normalized to compact human-readable format (e.g. "1h 23m 45s")
+- **Publish date column**: Formatted publish dates (e.g. "Feb 24, 2026") parsed from RFC 2822, stored as ISO 8601 for sortable ordering
+- **Resizable sidebar**: PanedWindow so the user can drag to resize the sidebar and main area
+- **Auto-refresh on startup**: All podcast feeds are refreshed in the background when the app launches
+- **Podcast artwork**: Icons loaded from feed image URLs in background threads, center-cropped to 24x24 squares using `PIL.ImageOps.fit()`, cached for the session
+- **Right-click context menus**: Podcast info dialog and episode actions (Transcribe, Analyze, Copy, Show Analysis) with contextual graying
+- **Episode summaries**: Blurbs from RSS feeds shown below each title, with HTML tags stripped
+- **Dynamic page sizing**: Episode list page size adjusts to fill the available window height, recalculating on resize
+- **Native cursor style**: Interactive list rows use the system arrow cursor, matching native macOS behavior
+- **macOS menu bar integration**: CoreFoundation ctypes sets the process name to "Rangoli" before Tk initializes. Native menu bar with File, View, AI menus and About dialog
+- **OpenAI transcript analysis**: Transcripts sent to GPT for summarization, displayed in a 3rd column panel, persisted in SQLite. Configurable prompt template via AI menu
+- **Three-state episode status**: Episodes progress through (empty) → Transcribed (green) → Analyzed (purple)
+
+## Design Tradeoffs
+
+- **Whisper model size vs. speed**: Defaults to `base` model (reasonable accuracy, moderate speed). Larger models give better accuracy but are significantly slower and need more RAM/VRAM
+- **faster-whisper tradeoffs**: int8 quantization on CPU trades marginal accuracy for ~4x speed. Optional dependency with graceful fallback
+- **pyannote.audio requires Hugging Face token**: Adds friction but pyannote is the most accurate open-source diarization available
+- **Speaker assignment by overlap**: O(S*T) algorithm works well but can mis-assign short segments at speaker boundaries
+- **No audio caching**: Episodes are re-downloaded on each run — keeps things simple but means re-transcribing requires re-downloading
+- **Threaded transcription**: Background threads with `after()` callbacks keep the GUI responsive. Cooperative cancellation via `threading.Event` stops within one segment
+- **Model preloading tradeoff**: Preloading `base`/`small` at startup increases memory ~300MB but eliminates loading latency. Larger models loaded on demand
+- **Dynamic page sizing**: Fills available space but page size changes on resize, requiring debounced recalculation
+- **Uniform progress across engines**: Both engines show identical per-segment progress. faster-whisper uses lazy generator; OpenAI Whisper's verbose output is captured via `_WhisperProgressWriter` stdout redirect
+- **SQLite for GUI only**: CLI writes plain `.txt` files for simplicity; no database dependency
+- **macOS process name via ctypes**: Uses CoreFoundation C API — no external deps, uses only macOS system libraries
+- **OpenAI analysis tradeoffs**: Requires API key and incurs costs. Optional `openai` package — menu item disabled if missing. Results cached in database to avoid redundant API calls
+
+## Project Structure
+
+```
+rangoli/
+  podcast_gui.py          # GUI entry point: macOS setup, PodcastApp class, main()
+  constants.py            # App identity, UI constants, default prompt
+  utils.py                # Pure formatting functions (no GUI deps)
+  feed.py                 # RSS feed fetching and parsing
+  transcription.py        # Whisper model cache, progress writer, feature flags
+  markdown_render.py      # Markdown-to-tkinter rendering
+  icons.py                # PIL icon processing
+  dialogs.py              # AddPodcastDialog class
+  podcast_transcriber.py  # CLI application
+  database.py             # SQLite database layer
+  icon.png                # Application icon (rangoli)
+  LICENSE                 # MIT License
+  requirements.txt
+  .env.example
+  DESIGN.md               # This file
+  transcripts/            # CLI output directory
+  podcasts.db             # SQLite database (created on first GUI run)
+```
+
+### Module Dependency Graph (no cycles)
+
+```
+constants.py          (no local imports)
+utils.py              (no local imports)
+feed.py               (no local imports)
+markdown_render.py    (no local imports)
+transcription.py  --> utils
+icons.py          --> constants
+dialogs.py        --> constants, feed, database
+podcast_gui.py    --> all of the above + database
+```
+
+## Implementation Notes
+
+- RSS parsing uses `feedparser` which handles various feed formats (RSS 2.0, Atom, etc.)
+- Audio enclosure detection checks `<enclosure>` tags, `<media:content>`, and link extensions as fallbacks
+- OpenAI Whisper transcription explicitly uses `fp16=False` since FP16 is not supported on CPU
+- faster-whisper uses CTranslate2 with `compute_type="int8"` on CPU for optimized inference
+- Whisper outputs timestamped segments; diarization produces a separate speaker timeline. These are merged by computing time overlap
+- Speaker labels are mapped to friendly names (`Speaker 1`, `Speaker 2`, ...) in order of first appearance
+- Filenames are sanitized to remove filesystem-unsafe characters
+- The GUI uses `threading` for non-blocking transcription, model preloading, feed refresh, and artwork loading; all UI updates go through `after()`
+- Thread-safe model cache (`_model_cache` with `threading.Lock`) ensures each engine+model combination is loaded only once
+- SQLite uses `PRAGMA foreign_keys = ON` with cascading deletes
+- Database schema stores transcripts with metadata (model, diarization flag, timestamp) for reproducibility
+- Optional dependencies (`faster-whisper`, `pyannote.audio`, `openai`) are wrapped in try/except with availability flags
+- OpenAI analysis runs in a background thread with results in a 3rd PanedWindow column, persisted in `analyses` table
+- Published dates stored in dual format: raw RFC 2822 for display and ISO 8601 for sortable ordering
+- Episode summaries extracted from RSS `summary` fields with HTML tags stripped via regex
+- Dynamic page sizing calculated from window height minus fixed overhead, with debounced resize
+- All interactive list rows set `cursor="arrow"` on both parent and children (tkinter doesn't propagate cursor)
+- macOS menu bar name set via CoreFoundation ctypes before tkinter import
+- Application icon set via `iconphoto()` for window and dock
+
 ## Security Considerations
 
-- **No API keys for basic use**: Transcription is fully local. Only diarization requires a Hugging Face token.
-- **Token storage**: `HF_TOKEN` is stored in `.env` (gitignored). Never logged or transmitted beyond Hugging Face API.
+- **No API keys for basic use**: Transcription is fully local. Only diarization requires a Hugging Face token. AI analysis requires an OpenAI API key.
+- **Token storage**: `HF_TOKEN` and `OPENAI_API_KEY` are stored in `.env` (gitignored). Never logged or transmitted beyond their respective APIs.
 - **No remote code execution**: Audio is processed locally by Whisper/CTranslate2. No user input is passed to shell commands.
 - **SSL certificate pinning**: Uses `certifi` CA bundle rather than system certificates for consistent SSL behavior across platforms.
 - **Filename sanitization**: `sanitize_filename()` strips `<>:"/\|?*` and truncates to 200 chars to prevent path traversal or filesystem issues.

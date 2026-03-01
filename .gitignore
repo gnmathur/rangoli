@@ -1,5 +1,6 @@
 *.swp
 .claude
+.env
 .idea
 podcasts.db
 transcripts

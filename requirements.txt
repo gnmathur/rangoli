@@ -7,3 +7,4 @@ python-dotenv
 torch
 torchaudio
 customtkinter
+openai

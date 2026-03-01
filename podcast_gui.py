@@ -9,21 +9,24 @@ Author:  Gaurav Mathur
 License: MIT
 """
 
-import email.utils
 import io
+import multiprocessing.resource_tracker
 import os
-import re
 import ssl
 import sys
 import tempfile
 import threading
 import time
+import warnings
 from pathlib import Path
 
-APP_NAME = "Rangoli"
-APP_VERSION = "1.0.0"
-APP_AUTHOR = "Gaurav Mathur"
-APP_YEAR = "2026"
+# Suppress harmless semaphore leak warning on Ctrl+C during model preloading
+warnings.filterwarnings("ignore", message="resource_tracker:.*semaphore", category=UserWarning)
+
+from constants import (APP_NAME, APP_VERSION, APP_AUTHOR, APP_YEAR,
+                       SIDEBAR_ICON_SIZE, WHISPER_MODELS, WHISPER_ENGINES,
+                       EPISODE_ROW_HEIGHT, EPISODE_OVERHEAD, MIN_EPISODES_PER_PAGE,
+                       ICON_PATH, DEFAULT_OPENAI_PROMPT)
 
 # Set macOS menu bar app name via CoreFoundation ctypes — MUST run before tkinter import
 if sys.platform == "darwin":
@@ -55,13 +58,22 @@ import tkinter as tk  # noqa: E402 — must be after CFBundleName override
 
 import certifi  # noqa: E402
 import customtkinter as ctk  # noqa: E402
-import feedparser  # noqa: E402
 import requests  # noqa: E402
 import whisper  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 from PIL import Image, ImageOps  # noqa: E402
 
 import database as db  # noqa: E402
+from utils import (format_timestamp, format_duration, estimate_remaining,  # noqa: E402
+                   strip_html, normalize_duration, format_publish_date)
+from feed import fetch_feed  # noqa: E402
+from transcription import (FASTER_WHISPER_AVAILABLE, DIARIZATION_AVAILABLE,  # noqa: E402
+                           OPENAI_AVAILABLE, TranscriptionCancelled,
+                           get_or_load_model, WhisperProgressWriter,
+                           DiarizationPipeline, openai)
+from markdown_render import insert_markdown  # noqa: E402
+from icons import make_square_icon  # noqa: E402
+from dialogs import AddPodcastDialog  # noqa: E402
 
 # SSL fix for macOS
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -69,358 +81,9 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=ce
 
 load_dotenv()
 
-# Optional faster-whisper engine
-try:
-    from faster_whisper import WhisperModel
-    FASTER_WHISPER_AVAILABLE = True
-except ImportError:
-    FASTER_WHISPER_AVAILABLE = False
-
-# Optional diarization
-try:
-    from pyannote.audio import Pipeline as DiarizationPipeline
-    DIARIZATION_AVAILABLE = True
-except ImportError:
-    DIARIZATION_AVAILABLE = False
-
-# ─── Model cache ─────────────────────────────────────────────────
-_model_cache = {}          # (engine, model_name) → loaded model instance
-_model_cache_lock = threading.Lock()
-
-
-def _get_or_load_model(engine, model_name, progress_fn=None):
-    """Return a cached model, loading it on first access.
-
-    Thread-safe: concurrent calls for the same key will block until the
-    first caller finishes loading.
-    """
-    key = (engine, model_name)
-    with _model_cache_lock:
-        if key in _model_cache:
-            return _model_cache[key]
-
-    # Load outside the lock (slow), then store
-    if engine == "faster-whisper" and FASTER_WHISPER_AVAILABLE:
-        if progress_fn:
-            progress_fn(f"Loading faster-whisper '{model_name}' (int8, cpu)...")
-        mdl = WhisperModel(model_name, device="cpu", compute_type="int8")
-    else:
-        if progress_fn:
-            progress_fn(f"Loading whisper '{model_name}'...")
-        mdl = whisper.load_model(model_name)
-
-    with _model_cache_lock:
-        _model_cache.setdefault(key, mdl)  # first writer wins
-        return _model_cache[key]
-
-
-class _TranscriptionCancelled(Exception):
-    """Raised when the user stops a transcription in progress."""
-
-
-# Regex to extract end timestamp from whisper verbose output:
-#   [00:05.123 --> 00:12.456] text   or   [01:05:32.123 --> 01:05:40.456] text
-_WHISPER_TS_RE = re.compile(r'-->\s*(?:(\d+):)?(\d+):(\d+\.\d+)\]')
-
-
-class _WhisperProgressWriter:
-    """Captures whisper verbose stdout to drive GUI progress updates.
-
-    Replaces sys.stdout during model.transcribe(verbose=True) so that each
-    printed segment line is parsed for its end timestamp, giving the same
-    per-segment progress that faster-whisper provides natively.
-    """
-
-    def __init__(self, audio_duration, stage_t0, update_fn, model_name, cancel_event):
-        self._audio_duration = audio_duration
-        self._stage_t0 = stage_t0
-        self._update_fn = update_fn
-        self._model_name = model_name
-        self._cancel_event = cancel_event
-        self._duration_str = format_timestamp(audio_duration)
-        self.segment_count = 0
-        self._buf = ""
-
-    def write(self, text):
-        if self._cancel_event.is_set():
-            raise _TranscriptionCancelled()
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self._parse_line(line)
-        return len(text)
-
-    def _parse_line(self, line):
-        m = _WHISPER_TS_RE.search(line)
-        if not m:
-            return
-        self.segment_count += 1
-        h = int(m.group(1)) if m.group(1) else 0
-        mins = int(m.group(2))
-        secs = float(m.group(3))
-        end_time = h * 3600 + mins * 60 + secs
-
-        seg_pct = min(end_time / self._audio_duration, 1.0) if self._audio_duration else 0
-        progress = 0.35 + seg_pct * 0.50
-        elapsed = time.monotonic() - self._stage_t0
-        eta = _estimate_remaining(elapsed, seg_pct)
-        eta_str = f" — ~{eta} remaining" if eta else ""
-        self._update_fn(
-            progress, "Stage 3/4: Transcribing",
-            f"whisper '{self._model_name}' — "
-            f"{self.segment_count} segments | "
-            f"{format_timestamp(end_time)} / {self._duration_str}"
-            f"{eta_str}")
-
-    def flush(self):
-        pass
-
-    # Forward attribute lookups (encoding, errors, etc.) to real stdout
-    def __getattr__(self, name):
-        return getattr(sys.__stdout__, name)
-
-
-SIDEBAR_ICON_SIZE = 24
-
-
-def _make_square_icon(pil_image, size=SIDEBAR_ICON_SIZE):
-    """Resize a PIL image to a uniform square CTkImage using center-crop."""
-    img = pil_image.convert("RGBA")
-    img = ImageOps.fit(img, (size, size), method=Image.LANCZOS, centering=(0.5, 0.5))
-    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
-
-
-WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
-WHISPER_ENGINES = ["whisper", "faster-whisper"]
-EPISODE_ROW_HEIGHT = 52  # title + blurb + padding
-EPISODE_OVERHEAD = 110  # top bar + progress area + padding
-MIN_EPISODES_PER_PAGE = 5
-ICON_PATH = Path(__file__).parent / "icon.png"
-
 # Theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-
-def fetch_feed(rss_url):
-    """Parse RSS feed and return podcast metadata with episodes."""
-    response = requests.get(rss_url, timeout=30)
-    response.raise_for_status()
-    feed = feedparser.parse(response.content)
-
-    if feed.bozo and not feed.entries:
-        raise ValueError(f"Could not parse feed at {rss_url}")
-
-    episodes = []
-    for entry in feed.entries:
-        audio_url = None
-        for enclosure in entry.get("enclosures", []):
-            if enclosure.get("type", "").startswith("audio/"):
-                audio_url = enclosure.get("href")
-                break
-        if not audio_url:
-            for media in entry.get("media_content", []):
-                if media.get("type", "").startswith("audio/"):
-                    audio_url = media.get("url")
-                    break
-        if not audio_url:
-            for link in entry.get("links", []):
-                href = link.get("href", "")
-                if any(href.lower().endswith(ext) for ext in [".mp3", ".m4a", ".wav", ".ogg", ".aac"]):
-                    audio_url = href
-                    break
-        if audio_url:
-            episodes.append({
-                "title": entry.get("title", "Untitled"),
-                "published": entry.get("published", ""),
-                "summary": entry.get("summary", "")[:200] if entry.get("summary") else "",
-                "audio_url": audio_url,
-                "duration": entry.get("itunes_duration", ""),
-            })
-
-    description = feed.feed.get("description") or feed.feed.get("subtitle", "")
-    image_url = ""
-    if feed.feed.get("image", {}).get("href"):
-        image_url = feed.feed["image"]["href"]
-    elif feed.feed.get("itunes_image", {}).get("href"):
-        image_url = feed.feed["itunes_image"]["href"]
-
-    return {
-        "title": feed.feed.get("title", "Unknown Podcast"),
-        "author": feed.feed.get("author", feed.feed.get("itunes_author", "")),
-        "description": description,
-        "image_url": image_url,
-        "episodes": episodes,
-    }
-
-
-def format_timestamp(seconds):
-    """Format seconds as HH:MM:SS."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _format_duration(seconds):
-    """Format seconds as human-readable duration (e.g. '2m 15s', '45s')."""
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"{m}m {s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m:02d}m"
-
-
-def _estimate_remaining(elapsed, fraction_done):
-    """Estimate time remaining given elapsed time and fraction completed (0-1).
-
-    Returns formatted string, or None if not enough data yet.
-    """
-    if fraction_done <= 0 or elapsed < 2:
-        return None
-    total_est = elapsed / fraction_done
-    remaining = total_est - elapsed
-    if remaining < 1:
-        return None
-    return _format_duration(remaining)
-
-
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
-_HTML_ENTITY_RE = re.compile(r'&\w+;|&#\d+;')
-
-
-def _strip_html(text):
-    """Remove HTML tags and collapse whitespace."""
-    text = _HTML_TAG_RE.sub(' ', text)
-    text = _HTML_ENTITY_RE.sub(' ', text)
-    return ' '.join(text.split())
-
-
-def _normalize_duration(raw):
-    """Normalize iTunes duration to compact format (e.g. '1h 23m 45s').
-
-    Handles: seconds ("3600"), "MM:SS" ("45:30"), "HH:MM:SS" ("1:23:45").
-    """
-    if not raw:
-        return ""
-    raw = raw.strip()
-
-    h = m = s = 0
-    # Pure seconds (e.g. "3600")
-    try:
-        total = int(raw)
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-    except ValueError:
-        # MM:SS or HH:MM:SS
-        parts = raw.split(":")
-        if len(parts) == 2:
-            try:
-                m, s = int(parts[0]), int(parts[1])
-                h, m = divmod(m, 60)
-            except ValueError:
-                return raw
-        elif len(parts) == 3:
-            try:
-                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-            except ValueError:
-                return raw
-        else:
-            return raw
-
-    if h > 0:
-        return f"{h}h {m}m {s}s"
-    if m > 0:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def _format_publish_date(raw):
-    """Format an RFC 2822 date string as 'Feb 24, 2026'. Falls back to raw string."""
-    if not raw:
-        return ""
-    try:
-        dt = email.utils.parsedate_to_datetime(raw)
-        return dt.strftime("%b %d, %Y")
-    except Exception:
-        return raw
-
-
-class AddPodcastDialog(ctk.CTkToplevel):
-    """Modal dialog to add a new podcast by RSS URL."""
-
-    def __init__(self, parent, on_add_callback):
-        super().__init__(parent)
-        self.on_add_callback = on_add_callback
-        self.title(f"{APP_NAME} — Add Podcast")
-        self.geometry("500x180")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-
-        # Center on parent
-        self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - 500) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - 180) // 2
-        self.geometry(f"+{x}+{y}")
-
-        frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        ctk.CTkLabel(frame, text="Podcast RSS Feed URL",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
-
-        self.url_entry = ctk.CTkEntry(frame, placeholder_text="https://feeds.example.com/podcast.xml",
-                                       width=460)
-        self.url_entry.pack(pady=(8, 12), fill="x")
-        self.url_entry.bind("<Return>", lambda e: self._on_add())
-
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="x")
-
-        self.status_label = ctk.CTkLabel(btn_frame, text="", text_color="gray")
-        self.status_label.pack(side="left")
-
-        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color="gray",
-                       hover_color="#555", command=self.destroy).pack(side="right", padx=(8, 0))
-        self.add_btn = ctk.CTkButton(btn_frame, text="Add", width=80, command=self._on_add)
-        self.add_btn.pack(side="right")
-
-        self.url_entry.focus()
-
-    def _on_add(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            return
-        self.add_btn.configure(state="disabled")
-        self.status_label.configure(text="Fetching feed...", text_color="#4a9eff")
-        threading.Thread(target=self._fetch_and_add, args=(url,), daemon=True).start()
-
-    def _fetch_and_add(self, url):
-        try:
-            podcast_data = fetch_feed(url)
-            podcast_id = db.add_podcast(
-                url, podcast_data["title"], podcast_data["author"], podcast_data["episodes"],
-                description=podcast_data.get("description", ""),
-                image_url=podcast_data.get("image_url", ""),
-            )
-            if podcast_id is None:
-                self.after(0, lambda: self.status_label.configure(
-                    text="Podcast already exists", text_color="#ff6b6b"))
-                self.after(0, lambda: self.add_btn.configure(state="normal"))
-                return
-            self.after(0, lambda: self._done(podcast_id))
-        except Exception as e:
-            self.after(0, lambda: self.status_label.configure(
-                text=f"Error: {e}", text_color="#ff6b6b"))
-            self.after(0, lambda: self.add_btn.configure(state="normal"))
-
-    def _done(self, podcast_id):
-        self.on_add_callback()
-        self.destroy()
 
 
 class PodcastApp(ctk.CTk):
@@ -443,16 +106,20 @@ class PodcastApp(ctk.CTk):
         self.episode_page = 0
         self.episode_total = 0
         self._transcribing = False
+        self._analyzing_ids = set()  # episode IDs currently being analyzed
         self._cancel_event = threading.Event()
 
-        self._transcript_panel = None
-        self._transcript_panel_visible = False
-        self._podcast_icon_cache = {}  # podcast_id → CTkImage (24x24)
+        self._podcast_icon_cache = {}  # podcast_id -> CTkImage (24x24)
 
         self._last_eps_per_page = MIN_EPISODES_PER_PAGE
 
+        # OpenAI configuration
+        self._openai_prompt = os.getenv("OPENAI_PROMPT", DEFAULT_OPENAI_PROMPT)
+        self._openai_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+
         self._build_menubar()
         self._build_ui()
+        self._build_analysis_panel()
         self._load_podcasts()
 
         # Reload episode list when window resizes so page fills available height
@@ -493,6 +160,11 @@ class PodcastApp(ctk.CTk):
         view_menu.add_command(label="Dark Mode", command=lambda: self._set_appearance("dark"))
         view_menu.add_command(label="Light Mode", command=lambda: self._set_appearance("light"))
 
+        # AI menu
+        ai_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="AI", menu=ai_menu)
+        ai_menu.add_command(label="Edit Prompt Template...", command=self._edit_prompt_template)
+
         # Help menu (non-macOS; on macOS About is in apple menu)
         if sys.platform != "darwin":
             help_menu = tk.Menu(menubar, tearoff=0)
@@ -510,14 +182,14 @@ class PodcastApp(ctk.CTk):
     def _show_about(self):
         about = ctk.CTkToplevel(self)
         about.title(f"About {APP_NAME}")
-        about.geometry("340x280")
+        about.geometry("340x320")
         about.resizable(False, False)
         about.transient(self)
         about.grab_set()
 
         about.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - 340) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - 280) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 320) // 2
         about.geometry(f"+{x}+{y}")
 
         frame = ctk.CTkFrame(about, fg_color="transparent")
@@ -542,6 +214,14 @@ class PodcastApp(ctk.CTk):
         ctk.CTkLabel(frame, text="MIT License",
                      font=ctk.CTkFont(size=11), text_color="gray").pack()
 
+        # Icon attribution
+        attr_label = ctk.CTkLabel(frame, text="Icon: Freepik - Flaticon",
+                                   font=ctk.CTkFont(size=10), text_color="#4a9eff",
+                                   cursor="hand2")
+        attr_label.pack(pady=(8, 0))
+        attr_label.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://www.flaticon.com/free-icons/pattern"))
+
         ctk.CTkButton(frame, text="OK", width=80, command=about.destroy).pack(pady=(12, 0))
 
     def _set_appearance(self, mode):
@@ -550,6 +230,49 @@ class PodcastApp(ctk.CTk):
         sash_color = "#333333" if mode == "dark" else "#cccccc"
         bg_color = "#333333" if mode == "dark" else "#ebebeb"
         self._paned.configure(bg=bg_color, sashpad=0)
+
+    def _edit_prompt_template(self):
+        """Open a dialog to edit the OpenAI prompt template."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"{APP_NAME} — Edit Prompt Template")
+        dialog.geometry("550x350")
+        dialog.resizable(True, True)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 550) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 350) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(frame, text="Prompt Template",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
+
+        textbox = ctk.CTkTextbox(frame, font=ctk.CTkFont(family="Menlo", size=13), wrap="word")
+        textbox.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        textbox.insert("1.0", self._openai_prompt)
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew")
+
+        def _save():
+            self._openai_prompt = textbox.get("1.0", "end-1c").strip()
+            dialog.destroy()
+
+        def _reset():
+            textbox.delete("1.0", "end")
+            textbox.insert("1.0", DEFAULT_OPENAI_PROMPT)
+
+        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color="gray",
+                       hover_color="#555", command=dialog.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_frame, text="Save", width=80, command=_save).pack(side="right")
+        ctk.CTkButton(btn_frame, text="Reset Default", width=110, fg_color="gray",
+                       hover_color="#555", command=_reset).pack(side="right", padx=(0, 8))
 
     # ─── UI Construction ─────────────────────────────────────────────
 
@@ -564,7 +287,7 @@ class PodcastApp(ctk.CTk):
 
         # Left sidebar
         self._sidebar = self._build_sidebar()
-        self._paned.add(self._sidebar, minsize=220, width=320)
+        self._paned.add(self._sidebar, minsize=220, width=340)
 
         # Right main area
         self._main_frame = self._build_main_area()
@@ -586,23 +309,19 @@ class PodcastApp(ctk.CTk):
         ctk.CTkLabel(header, text=APP_NAME,
                      font=ctk.CTkFont(size=18, weight="bold")).pack(side="left")
 
-        ctk.CTkButton(header, text="+", width=32, height=32,
-                       font=ctk.CTkFont(size=18),
-                       command=self._open_add_dialog).pack(side="right")
-
-        # Settings: Model, Engine, Diarize — grid-aligned
+        # Settings: Model, Engine, Diarize + Add Podcast — grid-aligned
         settings_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
         settings_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(settings_frame, text="Model:", font=ctk.CTkFont(size=12)
+        ctk.CTkLabel(settings_frame, text="Model:", font=ctk.CTkFont(size=14, weight="bold")
                      ).grid(row=0, column=0, sticky="w", pady=2)
         default_model = os.getenv("WHISPER_MODEL", "base")
         self.model_var = ctk.StringVar(value=default_model)
         ctk.CTkOptionMenu(settings_frame, variable=self.model_var, values=WHISPER_MODELS,
                            width=140, height=28).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=2)
 
-        ctk.CTkLabel(settings_frame, text="Engine:", font=ctk.CTkFont(size=12)
+        ctk.CTkLabel(settings_frame, text="Engine:", font=ctk.CTkFont(size=14, weight="bold")
                      ).grid(row=1, column=0, sticky="w", pady=2)
         default_engine = os.getenv("WHISPER_ENGINE", "whisper")
         if not FASTER_WHISPER_AVAILABLE and default_engine == "faster-whisper":
@@ -615,9 +334,12 @@ class PodcastApp(ctk.CTk):
         self.diarize_var = ctk.BooleanVar(value=DIARIZATION_AVAILABLE)
         diarize_cb = ctk.CTkCheckBox(settings_frame, text="Diarize", variable=self.diarize_var,
                                       height=28, checkbox_width=18, checkbox_height=18)
-        diarize_cb.grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
+        diarize_cb.grid(row=2, column=0, sticky="w", pady=2)
         if not DIARIZATION_AVAILABLE:
             diarize_cb.configure(state="disabled")
+
+        ctk.CTkButton(settings_frame, text="Add Podcast", width=100, height=28,
+                       command=self._open_add_dialog).grid(row=2, column=1, sticky="e", pady=2)
 
         # Podcast list (scrollable)
         self.podcast_list_frame = ctk.CTkScrollableFrame(sidebar, fg_color="transparent")
@@ -637,7 +359,7 @@ class PodcastApp(ctk.CTk):
         main.grid_rowconfigure(1, weight=1)
         main.grid_columnconfigure(0, weight=1)
 
-        # Top bar: episode list header + pagination + transcribe button
+        # Top bar: episode list header + pagination
         top_bar = ctk.CTkFrame(main, fg_color="transparent", height=40)
         top_bar.grid(row=0, column=0, sticky="ew")
 
@@ -645,21 +367,22 @@ class PodcastApp(ctk.CTk):
                                             font=ctk.CTkFont(size=15, weight="bold"))
         self.episode_header.pack(side="left")
 
-        # Transcribe button
-        self.transcribe_btn = ctk.CTkButton(top_bar, text="Transcribe", width=110,
-                                              state="disabled", command=self._on_transcribe)
-        self.transcribe_btn.pack(side="right", padx=(8, 0))
-
         # Pagination
         self.page_label = ctk.CTkLabel(top_bar, text="")
         self.page_label.pack(side="right", padx=6)
 
-        self.next_btn = ctk.CTkButton(top_bar, text=">", width=32, height=28,
-                                        command=self._next_page, state="disabled")
-        self.next_btn.pack(side="right")
-        self.prev_btn = ctk.CTkButton(top_bar, text="<", width=32, height=28,
-                                        command=self._prev_page, state="disabled")
+        self.last_btn = ctk.CTkButton(top_bar, text="Last \u25b6\u25b6", width=56, height=28,
+                                        cursor="arrow", command=self._last_page, state="disabled")
+        self.last_btn.pack(side="right")
+        self.next_btn = ctk.CTkButton(top_bar, text="Next \u25b6", width=56, height=28,
+                                        cursor="arrow", command=self._next_page, state="disabled")
+        self.next_btn.pack(side="right", padx=(0, 4))
+        self.prev_btn = ctk.CTkButton(top_bar, text="\u25c0 Prev", width=56, height=28,
+                                        cursor="arrow", command=self._prev_page, state="disabled")
         self.prev_btn.pack(side="right", padx=(0, 4))
+        self.first_btn = ctk.CTkButton(top_bar, text="\u25c0\u25c0 First", width=56, height=28,
+                                        cursor="arrow", command=self._first_page, state="disabled")
+        self.first_btn.pack(side="right", padx=(0, 4))
 
         # Episodes + progress
         pane = ctk.CTkFrame(main, fg_color="transparent")
@@ -676,7 +399,7 @@ class PodcastApp(ctk.CTk):
         self._episode_widgets = []
         self._selected_episode_idx = None
 
-        # Progress area
+        # Progress area with stop button
         progress_frame = ctk.CTkFrame(pane, fg_color="transparent", height=52)
         progress_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         progress_frame.grid_columnconfigure(0, weight=1)
@@ -685,65 +408,73 @@ class PodcastApp(ctk.CTk):
         self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.progress_bar.set(0)
 
+        self.stop_btn = ctk.CTkButton(progress_frame, text="Stop", width=76, height=30,
+                                        fg_color="#c0392b", hover_color="#e74c3c",
+                                        font=ctk.CTkFont(size=11),
+                                        command=self._on_stop)
+        self.stop_btn.grid(row=0, column=1)
+        self.stop_btn.grid_remove()  # hidden by default
+
         self.progress_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=12))
-        self.progress_label.grid(row=0, column=1)
+        self.progress_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         self.progress_detail = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=11),
                                              text_color="gray")
-        self.progress_detail.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self.progress_detail.grid(row=2, column=0, sticky="w", pady=(2, 0))
 
         return main
 
-    def _build_transcript_panel(self):
-        """Build the transcript panel (3rd column, initially hidden)."""
-        panel = ctk.CTkFrame(self._paned, width=180, corner_radius=0)
-        panel.grid_rowconfigure(1, weight=1)
-        panel.grid_columnconfigure(0, weight=1)
+    def _build_analysis_panel(self):
+        """Build the 3rd column analysis panel (not added to PanedWindow yet)."""
+        self._analysis_panel = ctk.CTkFrame(self._paned, corner_radius=0)
+        self._analysis_panel.grid_rowconfigure(1, weight=1)
+        self._analysis_panel.grid_columnconfigure(0, weight=1)
 
-        # Header
-        header = ctk.CTkFrame(panel, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
-        self._transcript_title = ctk.CTkLabel(header, text="Transcript",
-                                               font=ctk.CTkFont(size=15, weight="bold"))
-        self._transcript_title.pack(side="left")
+        # Row 0: header + close button
+        header = ctk.CTkFrame(self._analysis_panel, fg_color="transparent", height=36)
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
+        header.grid_columnconfigure(0, weight=1)
 
-        # Transcript textbox (read-only)
-        self.transcript_box = ctk.CTkTextbox(panel, font=ctk.CTkFont(family="Menlo", size=13),
-                                               wrap="word", state="disabled")
-        self.transcript_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 4))
+        ctk.CTkLabel(header, text="Analysis",
+                     font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(header, text="Close", width=60, height=28,
+                       command=self._close_analysis_panel).grid(row=0, column=1, sticky="e")
 
-        # Bottom bar: Copy + Close
-        bottom = ctk.CTkFrame(panel, fg_color="transparent")
-        bottom.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 12))
+        # Row 1: scrollable text
+        self._analysis_textbox = ctk.CTkTextbox(self._analysis_panel,
+                                                 font=ctk.CTkFont(family="Menlo", size=13),
+                                                 wrap="word", state="disabled")
+        self._analysis_textbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
 
-        ctk.CTkButton(bottom, text="Copy", width=70, command=self._copy_transcript
-                       ).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(bottom, text="Close", width=70, fg_color="gray",
-                       hover_color="#555", command=self._close_transcript_panel).pack(side="left")
+        # Row 2: copy button
+        ctk.CTkButton(self._analysis_panel, text="Copy", width=80, height=28,
+                       command=self._copy_analysis).grid(row=2, column=0, sticky="e", padx=8, pady=(0, 8))
 
-        return panel
+        self._analysis_panel_visible = False
 
-    def _show_transcript_panel(self):
-        """Show the transcript panel as 3rd pane if not already visible."""
-        if self._transcript_panel is None:
-            self._transcript_panel = self._build_transcript_panel()
-        if not self._transcript_panel_visible:
-            self._paned.add(self._transcript_panel, minsize=120, width=180)
-            self._transcript_panel_visible = True
+    def _show_analysis_panel(self, text):
+        """Show the analysis panel with markdown-formatted text."""
+        if not self._analysis_panel_visible:
+            self._paned.add(self._analysis_panel, minsize=200, width=300)
+            self._analysis_panel_visible = True
 
-    def _close_transcript_panel(self):
-        """Remove the transcript panel from the PanedWindow."""
-        if self._transcript_panel_visible and self._transcript_panel is not None:
-            self._paned.forget(self._transcript_panel)
-            self._transcript_panel_visible = False
+        self._analysis_textbox.configure(state="normal")
+        self._analysis_textbox.delete("1.0", "end")
+        insert_markdown(self._analysis_textbox, text)
+        self._analysis_textbox.configure(state="disabled")
 
-    def _copy_transcript(self):
-        """Copy transcript text to clipboard."""
-        self.transcript_box.configure(state="normal")
-        text = self.transcript_box.get("1.0", "end").strip()
-        self.transcript_box.configure(state="disabled")
-        self.clipboard_clear()
-        self.clipboard_append(text)
+    def _close_analysis_panel(self):
+        """Remove the analysis panel from the PanedWindow."""
+        if self._analysis_panel_visible:
+            self._paned.forget(self._analysis_panel)
+            self._analysis_panel_visible = False
+
+    def _copy_analysis(self):
+        """Copy the analysis text to clipboard."""
+        text = self._analysis_textbox.get("1.0", "end-1c")
+        if text.strip():
+            self.clipboard_clear()
+            self.clipboard_append(text)
 
     def _show_podcast_info(self, podcast_id):
         """Show podcast info in a modal dialog (right-click handler)."""
@@ -803,7 +534,7 @@ class PodcastApp(ctk.CTk):
         # Description (strip HTML)
         desc_box = ctk.CTkTextbox(frame, font=ctk.CTkFont(size=13), wrap="word", state="disabled")
         desc_box.grid(row=2, column=0, sticky="nsew", pady=(8, 8))
-        desc = _strip_html(podcast.get("description", ""))
+        desc = strip_html(podcast.get("description", ""))
         desc_box.configure(state="normal")
         if desc:
             desc_box.insert("1.0", desc)
@@ -831,7 +562,7 @@ class PodcastApp(ctk.CTk):
 
         # Default icon for podcasts without artwork
         if not hasattr(self, "_default_podcast_icon") and ICON_PATH.exists():
-            self._default_podcast_icon = _make_square_icon(Image.open(ICON_PATH))
+            self._default_podcast_icon = make_square_icon(Image.open(ICON_PATH))
 
         self._podcast_buttons = []
         for p in podcasts:
@@ -840,16 +571,18 @@ class PodcastApp(ctk.CTk):
                 p["id"], getattr(self, "_default_podcast_icon", None))
 
             row = ctk.CTkFrame(self.podcast_list_frame, fg_color="transparent",
-                                height=36, cursor="hand2")
+                                height=36, cursor="arrow")
             row.pack(fill="x", pady=1)
             row.grid_columnconfigure(1, weight=1)
 
             icon_label = ctk.CTkLabel(row, text="", image=icon,
-                                       width=SIDEBAR_ICON_SIZE, height=SIDEBAR_ICON_SIZE)
+                                       width=SIDEBAR_ICON_SIZE, height=SIDEBAR_ICON_SIZE,
+                                       cursor="arrow")
             icon_label.grid(row=0, column=0, padx=(4, 6), pady=4)
 
             name_label = ctk.CTkLabel(row, text=p["title"], anchor="w",
-                                       font=ctk.CTkFont(size=14, weight="bold"))
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       cursor="arrow")
             name_label.grid(row=0, column=1, sticky="w", pady=4)
 
             # Click handler
@@ -880,7 +613,7 @@ class PodcastApp(ctk.CTk):
         try:
             resp = requests.get(image_url, timeout=10)
             resp.raise_for_status()
-            icon = _make_square_icon(Image.open(io.BytesIO(resp.content)))
+            icon = make_square_icon(Image.open(io.BytesIO(resp.content)))
             self._podcast_icon_cache[podcast_id] = icon
             self.after(0, lambda: self._update_podcast_button_icon(podcast_id, icon))
         except Exception:
@@ -922,7 +655,6 @@ class PodcastApp(ctk.CTk):
         self.delete_btn.configure(state="disabled")
         self.episode_header.configure(text="Select a podcast to browse episodes")
         self._clear_episodes()
-        self._set_transcript_text("")
         self._load_podcasts()
 
     def _preload_models(self):
@@ -940,7 +672,7 @@ class PodcastApp(ctk.CTk):
         def _progress(msg):
             self._update_progress(0, "", msg)
         try:
-            _get_or_load_model(engine, model_name, progress_fn=_progress)
+            get_or_load_model(engine, model_name, progress_fn=_progress)
             self._update_progress(0, "", f"Model '{model_name}' ready")
         except Exception:
             pass
@@ -1010,8 +742,12 @@ class PodcastApp(ctk.CTk):
         total_pages = max(1, (self.episode_total + page_size - 1) // page_size)
         current_page = self.episode_page + 1
         self.page_label.configure(text=f"{current_page}/{total_pages}")
-        self.prev_btn.configure(state="normal" if self.episode_page > 0 else "disabled")
-        self.next_btn.configure(state="normal" if current_page < total_pages else "disabled")
+        on_first = self.episode_page == 0
+        on_last = current_page >= total_pages
+        self.first_btn.configure(state="disabled" if on_first else "normal")
+        self.prev_btn.configure(state="disabled" if on_first else "normal")
+        self.next_btn.configure(state="disabled" if on_last else "normal")
+        self.last_btn.configure(state="disabled" if on_last else "normal")
 
         if not episodes:
             ctk.CTkLabel(self.episode_list_frame, text="No episodes found.",
@@ -1025,7 +761,7 @@ class PodcastApp(ctk.CTk):
         hdr.grid_columnconfigure(1, weight=1)
         hdr.grid_columnconfigure(2, weight=0, minsize=120)
         hdr.grid_columnconfigure(3, weight=0, minsize=100)
-        hdr.grid_columnconfigure(4, weight=0, minsize=60)
+        hdr.grid_columnconfigure(4, weight=0, minsize=80)
 
         ctk.CTkLabel(hdr, text="#", font=ctk.CTkFont(size=11, weight="bold"),
                      width=30).grid(row=0, column=0, sticky="w")
@@ -1036,7 +772,7 @@ class PodcastApp(ctk.CTk):
         ctk.CTkLabel(hdr, text="Duration", font=ctk.CTkFont(size=11, weight="bold"),
                      width=100).grid(row=0, column=3)
         ctk.CTkLabel(hdr, text="Status", font=ctk.CTkFont(size=11, weight="bold"),
-                     width=60).grid(row=0, column=4)
+                     width=80).grid(row=0, column=4)
 
         self._episode_data = episodes
         self._episode_widgets = []
@@ -1044,46 +780,59 @@ class PodcastApp(ctk.CTk):
 
         for i, ep in enumerate(episodes):
             has_transcript = db.get_transcript(ep["id"]) is not None
+            has_analysis = db.get_analysis(ep["id"]) is not None
             row_num = i + 1
             global_num = self.episode_page * page_size + i + 1
 
             row = ctk.CTkFrame(self.episode_list_frame, fg_color="transparent",
-                                cursor="hand2")
+                                cursor="arrow")
             row.grid(row=row_num, column=0, sticky="ew", padx=4, pady=(2, 2))
             row.grid_columnconfigure(0, weight=0, minsize=30)
             row.grid_columnconfigure(1, weight=1)
             row.grid_columnconfigure(2, weight=0, minsize=120)
             row.grid_columnconfigure(3, weight=0, minsize=100)
-            row.grid_columnconfigure(4, weight=0, minsize=60)
+            row.grid_columnconfigure(4, weight=0, minsize=80)
 
             ctk.CTkLabel(row, text=str(global_num), width=30,
-                         font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky="w")
+                         font=ctk.CTkFont(size=12), cursor="arrow").grid(row=0, column=0, sticky="w")
             title_label = ctk.CTkLabel(row, text=ep["title"], anchor="w",
-                                        font=ctk.CTkFont(size=12, weight="bold"))
+                                        font=ctk.CTkFont(size=12, weight="bold"),
+                                        cursor="arrow")
             title_label.grid(row=0, column=1, sticky="w", padx=(4, 8))
-            ctk.CTkLabel(row, text=_format_publish_date(ep.get("published", "")), width=120,
-                         font=ctk.CTkFont(size=12), text_color="gray").grid(row=0, column=2)
-            ctk.CTkLabel(row, text=_normalize_duration(ep.get("duration", "")), width=100,
-                         font=ctk.CTkFont(size=12)).grid(row=0, column=3)
+            ctk.CTkLabel(row, text=format_publish_date(ep.get("published", "")), width=120,
+                         font=ctk.CTkFont(size=12), text_color="gray",
+                         cursor="arrow").grid(row=0, column=2)
+            ctk.CTkLabel(row, text=normalize_duration(ep.get("duration", "")), width=100,
+                         font=ctk.CTkFont(size=12), cursor="arrow").grid(row=0, column=3)
 
-            status_text = "Done" if has_transcript else ""
-            status_color = "#2ecc71" if has_transcript else "gray"
-            ctk.CTkLabel(row, text=status_text, width=60, text_color=status_color,
-                         font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=4)
+            if ep["id"] in self._analyzing_ids:
+                status_text, status_color = "Analyzing...", "#e67e22"
+            elif has_analysis:
+                status_text, status_color = "Analyzed", "#9b59b6"
+            elif has_transcript:
+                status_text, status_color = "Transcribed", "#2ecc71"
+            else:
+                status_text, status_color = "", "gray"
+            ctk.CTkLabel(row, text=status_text, width=80, text_color=status_color,
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         cursor="arrow").grid(row=0, column=4)
 
             # Episode blurb/summary below title
-            summary = _strip_html(ep.get("summary", "")).strip()
+            summary = strip_html(ep.get("summary", "")).strip()
             if summary:
                 if len(summary) > 150:
                     summary = summary[:150].rstrip() + "..."
                 blurb_label = ctk.CTkLabel(row, text=summary, anchor="w",
                                             font=ctk.CTkFont(size=11), text_color="gray",
-                                            wraplength=500, justify="left")
+                                            wraplength=500, justify="left",
+                                            cursor="arrow")
                 blurb_label.grid(row=1, column=1, columnspan=4, sticky="w", padx=(4, 8))
 
-            # Bind click on the whole row
+            # Bind left-click to select, right-click for context menu
             for widget in [row] + list(row.winfo_children()):
                 widget.bind("<Button-1>", lambda e, idx=i: self._select_episode(idx))
+                widget.bind("<Button-2>", lambda e, idx=i: self._show_episode_menu(e, idx))
+                widget.bind("<Button-3>", lambda e, idx=i: self._show_episode_menu(e, idx))
 
             self._episode_widgets.append(row)
 
@@ -1092,14 +841,13 @@ class PodcastApp(ctk.CTk):
             w.destroy()
         self._episode_widgets = []
         self._selected_episode_idx = None
-        self.transcribe_btn.configure(state="disabled")
         self.page_label.configure(text="")
+        self.first_btn.configure(state="disabled")
         self.prev_btn.configure(state="disabled")
         self.next_btn.configure(state="disabled")
+        self.last_btn.configure(state="disabled")
 
     def _select_episode(self, idx):
-        if self._transcribing:
-            return
         self._selected_episode_idx = idx
 
         # Highlight
@@ -1109,25 +857,69 @@ class PodcastApp(ctk.CTk):
             else:
                 w.configure(fg_color="transparent")
 
-        self.transcribe_btn.configure(state="normal")
-
-        # Show existing transcript if available
+    def _show_episode_menu(self, event, idx):
+        """Show a right-click context menu for an episode."""
+        self._select_episode(idx)
         ep = self._episode_data[idx]
-        transcript = db.get_transcript(ep["id"])
-        if transcript:
-            self._set_transcript_text(transcript["text"])
-        else:
-            self._set_transcript_text(f"No transcript yet.\n\nClick 'Transcribe' to generate one "
-                                      f"using the '{self.model_var.get()}' model.")
+        has_transcript = db.get_transcript(ep["id"]) is not None
+        has_analysis = db.get_analysis(ep["id"]) is not None
+        has_api_key = bool(os.getenv("OPENAI_API_KEY"))
 
-    def _next_page(self):
-        self.episode_page += 1
+        menu = tk.Menu(self, tearoff=0)
+        # Transcribe — disabled if already transcribed or currently transcribing
+        if has_transcript or self._transcribing:
+            menu.add_command(label="Transcribe", state="disabled")
+        else:
+            menu.add_command(label="Transcribe", command=self._on_transcribe)
+        menu.add_separator()
+        # Analyze with AI — disabled if no transcript, already analyzing this episode, or no API key
+        ep_analyzing = ep["id"] in self._analyzing_ids
+        if has_transcript and not ep_analyzing and has_api_key and OPENAI_AVAILABLE:
+            menu.add_command(label="Analyze with AI",
+                             command=lambda: self._analyze_episode(ep["id"]))
+        else:
+            menu.add_command(label="Analyze with AI", state="disabled")
+        menu.add_separator()
+        # Copy Transcript — disabled if no transcript
+        if has_transcript:
+            menu.add_command(label="Copy Transcript",
+                             command=lambda: self._copy_episode_transcript(ep["id"]))
+        else:
+            menu.add_command(label="Copy Transcript", state="disabled")
+        # Show Analysis — disabled if no analysis exists
+        if has_analysis:
+            menu.add_command(label="Show Analysis",
+                             command=lambda: self._show_saved_analysis(ep["id"]))
+        else:
+            menu.add_command(label="Show Analysis", state="disabled")
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_episode_transcript(self, episode_id):
+        """Copy an episode's transcript to clipboard."""
+        transcript = db.get_transcript(episode_id)
+        if transcript:
+            self.clipboard_clear()
+            self.clipboard_append(transcript["text"])
+
+    def _first_page(self):
+        self.episode_page = 0
         self._load_episodes()
 
     def _prev_page(self):
         if self.episode_page > 0:
             self.episode_page -= 1
             self._load_episodes()
+
+    def _next_page(self):
+        self.episode_page += 1
+        self._load_episodes()
+
+    def _last_page(self):
+        page_size = self._episodes_per_page()
+        total_pages = max(1, (self.episode_total + page_size - 1) // page_size)
+        self.episode_page = total_pages - 1
+        self._load_episodes()
 
     # ─── Transcription ───────────────────────────────────────────────
 
@@ -1142,13 +934,10 @@ class PodcastApp(ctk.CTk):
 
         self._transcribing = True
         self._cancel_event.clear()
-        self.transcribe_btn.configure(
-            state="normal", text="Stop", fg_color="#c0392b",
-            hover_color="#e74c3c", command=self._on_stop)
+        self.stop_btn.grid()  # show stop button
         self.progress_bar.set(0)
         self.progress_label.configure(text="Starting...")
         self.progress_detail.configure(text=f"{engine} '{model_name}'")
-        self._set_transcript_text("")
 
         threading.Thread(target=self._transcribe_worker,
                          args=(ep, model_name, do_diarize, engine), daemon=True).start()
@@ -1156,12 +945,12 @@ class PodcastApp(ctk.CTk):
     def _on_stop(self):
         """Signal the worker thread to stop."""
         self._cancel_event.set()
-        self.transcribe_btn.configure(state="disabled", text="Stopping...")
+        self.stop_btn.configure(state="disabled", text="Stopping...")
 
     def _check_cancelled(self):
-        """Raise _TranscriptionCancelled if the user pressed Stop."""
+        """Raise TranscriptionCancelled if the user pressed Stop."""
         if self._cancel_event.is_set():
-            raise _TranscriptionCancelled()
+            raise TranscriptionCancelled()
 
     def _transcribe_worker(self, episode, model_name, do_diarize, engine="whisper"):
         job_t0 = time.monotonic()
@@ -1192,7 +981,7 @@ class PodcastApp(ctk.CTk):
                         if total:
                             dl_pct = downloaded / total
                             elapsed = time.monotonic() - stage_t0
-                            eta = _estimate_remaining(elapsed, dl_pct)
+                            eta = estimate_remaining(elapsed, dl_pct)
                             eta_str = f" — ~{eta} remaining" if eta else ""
                             self._update_progress(
                                 0.05 + dl_pct * 0.25,
@@ -1211,7 +1000,7 @@ class PodcastApp(ctk.CTk):
                 if engine == "faster-whisper" and FASTER_WHISPER_AVAILABLE:
                     self._update_progress(0.32, "Stage 2/4: Loading model",
                                           f"faster-whisper '{model_name}' (int8, cpu)")
-                    fw_model = _get_or_load_model(engine, model_name)
+                    fw_model = get_or_load_model(engine, model_name)
                     self._check_cancelled()
 
                     # ── Stage 3: Transcribe (faster-whisper) ─────────
@@ -1228,7 +1017,7 @@ class PodcastApp(ctk.CTk):
                         seg_pct = min(seg.end / audio_duration, 1.0) if audio_duration else 0
                         progress = 0.35 + seg_pct * 0.50
                         elapsed = time.monotonic() - stage_t0
-                        eta = _estimate_remaining(elapsed, seg_pct)
+                        eta = estimate_remaining(elapsed, seg_pct)
                         eta_str = f" — ~{eta} remaining" if eta else ""
                         self._update_progress(
                             progress, "Stage 3/4: Transcribing",
@@ -1240,11 +1029,11 @@ class PodcastApp(ctk.CTk):
                     self._update_progress(0.85, "Transcription complete",
                                           f"faster-whisper '{model_name}' — "
                                           f"{len(segments)} segments | {duration_str} "
-                                          f"in {_format_duration(transcribe_elapsed)}")
+                                          f"in {format_duration(transcribe_elapsed)}")
                 else:
                     self._update_progress(0.32, "Stage 2/4: Loading model",
                                           f"whisper '{model_name}'")
-                    model = _get_or_load_model(engine, model_name)
+                    model = get_or_load_model(engine, model_name)
                     self._check_cancelled()
 
                     # ── Stage 3: Transcribe (whisper, per-segment via stdout capture)
@@ -1254,7 +1043,7 @@ class PodcastApp(ctk.CTk):
                     duration_str = format_timestamp(audio_duration)
                     self._update_progress(0.35, "Stage 3/4: Transcribing",
                                           f"whisper '{model_name}' — starting...")
-                    progress_writer = _WhisperProgressWriter(
+                    progress_writer = WhisperProgressWriter(
                         audio_duration, stage_t0, self._update_progress,
                         model_name, self._cancel_event)
                     old_stdout = sys.stdout
@@ -1268,7 +1057,7 @@ class PodcastApp(ctk.CTk):
                     self._update_progress(0.85, "Transcription complete",
                                           f"whisper '{model_name}' — {len(segments)} segments "
                                           f"| {duration_str} "
-                                          f"in {_format_duration(transcribe_elapsed)}")
+                                          f"in {format_duration(transcribe_elapsed)}")
 
                 self._check_cancelled()
 
@@ -1287,7 +1076,7 @@ class PodcastApp(ctk.CTk):
                         self._check_cancelled()
                         self._update_progress(0.90, "Stage 4/4: Speaker diarization",
                                               f"pyannote.audio — analyzing speakers "
-                                              f"(elapsed {_format_duration(time.monotonic() - stage_t0)})...")
+                                              f"(elapsed {format_duration(time.monotonic() - stage_t0)})...")
                         diarization = pipeline(str(tmp_path))
                         self._check_cancelled()
 
@@ -1338,24 +1127,138 @@ class PodcastApp(ctk.CTk):
 
                 total_elapsed = time.monotonic() - job_t0
                 self._update_progress(1.0, "Done!",
-                                      f"Total time: {_format_duration(total_elapsed)}")
-                self.after(0, lambda: self._set_transcript_text(transcript_text))
+                                      f"Total time: {format_duration(total_elapsed)}")
                 self.after(0, self._load_episodes)
 
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
-        except _TranscriptionCancelled:
+        except TranscriptionCancelled:
             elapsed = time.monotonic() - job_t0
             self._update_progress(0, "Cancelled",
-                                  f"Stopped after {_format_duration(elapsed)}")
-            self.after(0, lambda: self._set_transcript_text("Transcription cancelled."))
+                                  f"Stopped after {format_duration(elapsed)}")
         except Exception as e:
-            self.after(0, lambda: self._set_transcript_text(f"Error: {e}"))
             self._update_progress(0, f"Error: {e}", "")
         finally:
             self.after(0, self._transcription_done)
+
+    # ─── OpenAI Analysis ────────────────────────────────────────────
+
+    def _analyze_episode(self, episode_id):
+        """Start analyzing an episode transcript with OpenAI in the background."""
+        transcript = db.get_transcript(episode_id)
+        if not transcript:
+            return
+
+        self._analyzing_ids.add(episode_id)
+        self._load_episodes()
+
+        threading.Thread(
+            target=self._analyze_worker,
+            args=(episode_id, transcript["text"]),
+            daemon=True,
+        ).start()
+
+    def _analyze_worker(self, episode_id, transcript_text):
+        """Background: call OpenAI API and save result."""
+        try:
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            response = client.chat.completions.create(
+                model=self._openai_model,
+                messages=[
+                    {"role": "system", "content": self._openai_prompt},
+                    {"role": "user", "content": transcript_text},
+                ],
+            )
+            analysis_text = response.choices[0].message.content
+
+            db.save_analysis(episode_id, analysis_text, self._openai_prompt, self._openai_model)
+
+            self.after(0, lambda: self._on_analysis_complete(analysis_text))
+        except Exception as e:
+            err_msg = str(e)
+            if hasattr(e, 'message'):
+                err_msg = e.message
+            self.after(0, lambda: self._on_analysis_error(err_msg))
+        finally:
+            self.after(0, lambda: self._analysis_done(episode_id))
+
+    def _on_analysis_complete(self, analysis_text):
+        """Show a success dialog with the analysis result."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"{APP_NAME} — Analysis Complete")
+        dialog.geometry("550x400")
+        dialog.resizable(True, True)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 550) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 400) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(frame, text="Analysis Complete",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#2ecc71").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        msg_box = ctk.CTkTextbox(frame, font=ctk.CTkFont(family="Menlo", size=13),
+                                  wrap="word", state="disabled")
+        msg_box.grid(row=1, column=0, sticky="nsew")
+        msg_box.configure(state="normal")
+        insert_markdown(msg_box, analysis_text)
+        msg_box.configure(state="disabled")
+
+        ctk.CTkButton(frame, text="OK", width=80,
+                       command=dialog.destroy).grid(row=2, column=0, sticky="e", pady=(12, 0))
+
+    def _on_analysis_error(self, err_msg):
+        """Show analysis error in a dialog."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"{APP_NAME} — Analysis Error")
+        dialog.geometry("480x200")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 480) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 200) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(frame, text="Analysis Failed",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#e74c3c").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        msg_box = ctk.CTkTextbox(frame, font=ctk.CTkFont(size=13), wrap="word",
+                                  height=80, state="disabled")
+        msg_box.grid(row=1, column=0, sticky="nsew")
+        msg_box.configure(state="normal")
+        msg_box.insert("1.0", err_msg)
+        msg_box.configure(state="disabled")
+
+        ctk.CTkButton(frame, text="OK", width=80,
+                       command=dialog.destroy).grid(row=2, column=0, sticky="e", pady=(12, 0))
+
+    def _analysis_done(self, episode_id):
+        self._analyzing_ids.discard(episode_id)
+        self._load_episodes()
+
+    def _show_saved_analysis(self, episode_id):
+        """Show a previously saved analysis in the 3rd column panel."""
+        analysis = db.get_analysis(episode_id)
+        if analysis:
+            self._show_analysis_panel(analysis["text"])
 
     def _update_progress(self, value, text, detail=""):
         self.after(0, lambda: self.progress_bar.set(value))
@@ -1364,19 +1267,9 @@ class PodcastApp(ctk.CTk):
 
     def _transcription_done(self):
         self._transcribing = False
-        self.transcribe_btn.configure(
-            state="normal", text="Transcribe", fg_color=("#3a7ebf", "#1f538d"),
-            hover_color=("#325882", "#14375e"), command=self._on_transcribe)
+        self.stop_btn.configure(state="normal", text="Stop")
+        self.stop_btn.grid_remove()  # hide stop button
 
-    # ─── Transcript display ──────────────────────────────────────────
-
-    def _set_transcript_text(self, text):
-        self._show_transcript_panel()
-        self.transcript_box.configure(state="normal")
-        self.transcript_box.delete("1.0", "end")
-        if text:
-            self.transcript_box.insert("1.0", text)
-        self.transcript_box.configure(state="disabled")
 
 
 def main():

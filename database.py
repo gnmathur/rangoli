@@ -67,6 +67,16 @@ def init_db(db_path=None):
             transcribed_at TEXT NOT NULL,
             FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id INTEGER UNIQUE NOT NULL,
+            text TEXT NOT NULL,
+            prompt_used TEXT NOT NULL,
+            model_used TEXT NOT NULL,
+            analyzed_at TEXT NOT NULL,
+            FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+        );
     """)
     # Migrate existing databases: add new columns if missing
     try:
@@ -237,6 +247,30 @@ def get_transcript(episode_id):
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM transcripts WHERE episode_id = ?", (episode_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# --- Analysis CRUD ---
+
+def save_analysis(episode_id, text, prompt_used, model_used):
+    """Save or replace an analysis for an episode."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO analyses (episode_id, text, prompt_used, model_used, analyzed_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (episode_id, text, prompt_used, model_used, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_analysis(episode_id):
+    """Return analysis for an episode, or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM analyses WHERE episode_id = ?", (episode_id,)
     ).fetchone()
     conn.close()
     return dict(row) if row else None
