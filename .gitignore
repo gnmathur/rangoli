@@ -1,0 +1,8 @@
+*.swp
+.claude
+.idea
+podcasts.db
+transcripts
+__pycache__
+.venv
+

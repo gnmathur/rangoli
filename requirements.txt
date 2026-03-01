@@ -1,0 +1,9 @@
+openai-whisper
+faster-whisper
+pyannote.audio
+feedparser
+requests
+python-dotenv
+torch
+torchaudio
+customtkinter
